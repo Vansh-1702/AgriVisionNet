@@ -1,0 +1,165 @@
+# =============================================================================
+# AgriVisionNet — Central Configuration
+# Single source of truth for backbone, fusion, heads, data, and training.
+# Every module reads from this file so future modalities (weather/IoT/soil/
+# drone/LLM/yield) can be added as new config blocks without touching code.
+# =============================================================================
+
+project:
+  name: AgriVisionNet
+  seed: 42
+  device: cuda   # cuda | cpu
+  output_dir: outputs/
+  weights_dir: weights/
+
+# -----------------------------------------------------------------------------
+# Backbone: two parallel feature extractors feeding the fusion module.
+# -----------------------------------------------------------------------------
+backbone:
+  cnn:
+    name: efficientnet_b0          # timm model name
+    pretrained: true
+    out_indices: [4]               # final stage feature map, C_cnn=1280, HxW=7x7 @224
+    freeze_stem: false
+  transformer:
+    name: swin_tiny_patch4_window7_224   # timm model name
+    pretrained: true
+    out_indices: [3]                # final stage, C_swin=768, 7x7 tokens @224
+    freeze_patch_embed: false
+  input_size: 224
+
+# -----------------------------------------------------------------------------
+# FROZEN ARCHITECTURE: Task- and Hierarchy-Aware Evidential Fusion
+#
+# Positioning (see research/design_rationale.md for full literature review):
+#   - This is an INTEGRATED SYSTEMS CONTRIBUTION, not a claim of inventing
+#     CNN-Transformer fusion or evidential deep learning.
+#   - Evidential Deep Learning: Sensoy, Kaplan, Kandemir. "Evidential Deep
+#     Learning to Quantify Classification Uncertainty." NeurIPS 2018.
+#   - Decision-level evidential multi-view fusion (our nearest baseline):
+#     Han et al. "Trusted Multi-View Classification." ICLR 2021 (TMC), and
+#     its journal extension (ETMC).
+#   - Dempster-Shafer discounting operator (classical, used for the
+#     hierarchical component): Shafer. "A Mathematical Theory of Evidence."
+#     1976.
+#   - Channel/spatial attention re-used as standard building blocks, not
+#     claimed as novel: Hu et al. (SENet, CVPR 2018); Woo et al. (CBAM,
+#     ECCV 2018).
+#   - Related but distinct feature-level gated fusion baselines used for
+#     comparison in ablations: Joze et al. (MMTM, CVPR 2020); Dai et al.
+#     (AFF/iAFF, WACV 2021); Chen et al. (Mobile-Former, CVPR 2022).
+#
+# Our delta vs. TMC/ETMC: (1) fusion happens at the FEATURE level (before
+# shared multi-task heads), not the decision level, so a single spatial
+# representation survives into explainability; (2) fusion is TASK-AWARE
+# (a separate gate per task head, not one shared gate) — TMC/ETMC/QMF/RCML
+# are all single-task; (3) fusion is HIERARCHY-AWARE — severity's evidence
+# is Dempster-Shafer-discounted by disease's uncertainty, formalizing the
+# fact that severity is only meaningful conditional on disease identity.
+# No individual mechanism here is new; the specific combination applied to
+# multi-task hybrid CNN-Transformer crop disease diagnosis is the claim.
+# -----------------------------------------------------------------------------
+fusion:
+  type: task_hierarchy_evidential_fusion   # see models/fusion/task_hierarchy_fusion.py
+  projected_dim: 512            # common dim both branches are projected into
+  se_reduction: 16               # channel-attention (SE) reduction ratio, standard component
+  spatial_kernel: 7               # spatial-attention conv kernel, standard component
+  gate_hidden_dim: 128            # per-task reliability-gate MLP hidden size
+  dropout: 0.1
+  use_residual: true
+  # auxiliary lightweight evidential heads used ONLY to estimate per-branch
+  # reliability (not the final task predictions) — see models/evidential.py
+  auxiliary_evidence_dim: 128
+
+# -----------------------------------------------------------------------------
+# Multi-task heads
+# All three heads are EVIDENTIAL (Dirichlet) heads, not softmax heads — see
+# models/evidential.py. This is required for the reliability/discounting
+# mechanism above, not merely a loss-function swap.
+# -----------------------------------------------------------------------------
+heads:
+  shared_dim: 512
+  crop:
+    num_classes: 9        # e.g. tomato, potato, corn, apple, rice, grape, pepper, ...
+    hidden_dim: 256
+    dropout: 0.3
+  disease:
+    num_classes: 38       # PlantVillage-style union label space; override per dataset
+    hidden_dim: 256
+    dropout: 0.3
+  severity:
+    num_classes: 4         # healthy / mild / moderate / severe
+    hidden_dim: 128
+    dropout: 0.2
+
+# -----------------------------------------------------------------------------
+# Evidential loss (per-task type-II MLE + annealed KL regularizer)
+# Sensoy et al., NeurIPS 2018, Eq. 3-5. Fixed per-task weights are used
+# (not learned uncertainty-weighting) because the tasks' own evidential
+# uncertainty already provides a per-sample reliability signal; stacking a
+# second, independent uncertainty-weighting scheme on top would confound
+# the ablation of the hierarchy-discounting mechanism. This IS an ablation
+# arm to report (fixed weights vs. learned), not assumed a priori.
+# -----------------------------------------------------------------------------
+loss:
+  strategy: evidential
+  fixed_weights:
+    crop: 1.0
+    disease: 1.0
+    severity: 1.0
+  kl_annealing_steps: 10          # epochs over which KL regularizer ramps 0 -> 1
+  discount_severity_by_disease_uncertainty: true
+  aux_reliability_loss_weight: 0.3   # supervises the fusion module's branch-reliability heads
+
+# -----------------------------------------------------------------------------
+# Unknown / out-of-distribution disease detection
+# -----------------------------------------------------------------------------
+ood:
+  method: mahalanobis          # energy | mahalanobis | openmax
+  confidence_threshold: 0.6
+  mahalanobis:
+    num_classes_ref: disease
+    eps: 1.0e-6
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  datasets:
+    - name: plantvillage
+      root: data/plantvillage/
+      enabled: true
+    - name: paddy_doctor
+      root: data/paddy_doctor/
+      enabled: false
+    - name: rice_disease
+      root: data/rice_disease/
+      enabled: false
+  severity_annotations_csv: null   # path to research/severity_annotation_protocol.md's consensus CSV once it exists (datasets/severity_annotations.py); null = no severity labels, matches end-of-Phase-2 behavior
+  image_size: 224
+  batch_size: 32
+  num_workers: 8
+  augmentation:
+    random_crop: true
+    horizontal_flip: true
+    rotation_degrees: 20
+    color_jitter: true
+    mixup_alpha: 0.2
+    cutmix_alpha: 1.0
+    mixup_cutmix_prob: 0.5
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  epochs: 100
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.05
+  scheduler: cosine_warmup
+  warmup_epochs: 5
+  mixed_precision: true
+  early_stopping_patience: 12
+  grad_clip_norm: 1.0
+  log_dir: outputs/tensorboard/
+  use_wandb: false
